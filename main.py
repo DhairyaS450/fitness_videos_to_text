@@ -1,34 +1,60 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # This hides INFO/WARNING messages
+# os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
 import cv2
 import mediapipe as mp
 import numpy as np
-import os  # NEW: Import os to walk directories
+import os
 
-# Initialize MediaPipe pose components
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
 
 def calculate_angle(a, b, c):
-    """
-    Utility function:
-    Calculates the angle (in degrees) between three points (a, b, c).
-    Each point is a [x, y] coordinate.
-    """
-    a = np.array(a)  # First coordinate
-    b = np.array(b)  # Midpoint (joint)
-    c = np.array(c)  # Last coordinate
-
+    # Same as before
+    a, b, c = np.array(a), np.array(b), np.array(c)
     ba = a - b
     bc = c - b
     cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
     angle = np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
     return angle
 
-def process_video(video_path):
-    # Open the video file
-    cap = cv2.VideoCapture(video_path)
+def get_frame_angles(landmarks, frame_shape):
+    # Return a dictionary of angles for the entire body
+    h, w, _ = frame_shape
 
-    # Lists to store angle data, etc.
-    knee_angles = []  # Example: tracking knee angle to detect squats
+    def coords(idx):
+        return (landmarks[idx].x * w, landmarks[idx].y * h)
+
+    angles = {}
+    # Example for left knee, left hip, left ankle
+    angles['left_knee'] = calculate_angle(
+        coords(mp_pose.PoseLandmark.LEFT_HIP.value),
+        coords(mp_pose.PoseLandmark.LEFT_KNEE.value),
+        coords(mp_pose.PoseLandmark.LEFT_ANKLE.value)
+    )
+    # Add more angles for shoulders, elbows, etc.
+    angles['left_elbow'] = calculate_angle(
+        coords(mp_pose.PoseLandmark.LEFT_SHOULDER.value),
+        coords(mp_pose.PoseLandmark.LEFT_ELBOW.value),
+        coords(mp_pose.PoseLandmark.LEFT_WRIST.value)
+    )
+    # Continue for right side or other joints you care about...
+    return angles
+
+def process_video(video_path):
+    print(f"Processing video: {video_path}")  # Add progress indicator
+    cap = cv2.VideoCapture(video_path)
+    
+    if not cap.isOpened():
+        print(f"Error: Could not open video file {video_path}")
+        return []
+        
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"Total frames: {total_frames}")
+    
+    angle_time_series = []
+    frame_count = 0
 
     with mp_pose.Pose(
         static_image_mode=False,
@@ -40,82 +66,91 @@ def process_video(video_path):
         while True:
             ret, frame = cap.read()
             if not ret:
-                break  # End of video
+                break
+                
+            frame_count += 1
+            if frame_count % 30 == 0:  # Show progress every 30 frames
+                print(f"Processing frame {frame_count}/{total_frames}")
 
-            # Convert the BGR image to RGB
-            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            try:
+                image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = pose.process(image_rgb)
 
-            # Process with MediaPipe Pose
-            results = pose.process(image_rgb)
+                if results.pose_landmarks:
+                    # Calculate angles for this frame
+                    frame_angles = get_frame_angles(results.pose_landmarks.landmark, frame.shape)
+                    angle_time_series.append(frame_angles)
+            except Exception as e:
+                print(f"Error processing frame {frame_count}: {str(e)}")
+                continue
 
-            if results.pose_landmarks:
-                # Extract landmarks
-                landmarks = results.pose_landmarks.landmark
-
-                # Helper function to get a landmark's (x, y) coords in image space
-                def get_coord(idx):
-                    h, w, _ = frame.shape
-                    return [landmarks[idx].x * w, landmarks[idx].y * h]
-
-                # Example: let's calculate angle of left knee
-                left_hip = get_coord(mp_pose.PoseLandmark.LEFT_HIP.value)
-                left_knee = get_coord(mp_pose.PoseLandmark.LEFT_KNEE.value)
-                left_ankle = get_coord(mp_pose.PoseLandmark.LEFT_ANKLE.value)
-
-                knee_angle = calculate_angle(left_hip, left_knee, left_ankle)
-                knee_angles.append(knee_angle)
-
-            # If you want to visualize in real-time, uncomment these lines:
-            # mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-            # cv2.imshow('Frame', frame)
-            # if cv2.waitKey(1) & 0xFF == ord('q'):
-            #     break
-
-        # Release resources
         cap.release()
-        # cv2.destroyAllWindows()
+    print(f"Completed processing video: {video_path}")
+    return angle_time_series
 
-    return knee_angles
+def identify_exercise(angle_time_series):
+    # Simple placeholder logic (heuristic)
+    # Example: if the left_knee angle range is large, guess "Squat," etc.
+    if not angle_time_series:
+        return "Unknown"
 
-def generate_text_summary(knee_angles):
-    """
-    Simple rule-based approach for demonstration:
-    - If the knee angle repeatedly transitions from ~40° to ~150°, we might guess 'squats'.
-    - Provide a rough textual summary based on these transitions.
-    """
-    if not knee_angles:
-        return "No keypoints or movement data detected."
+    left_knee_angles = [f['left_knee'] for f in angle_time_series if 'left_knee' in f]
+    knee_range = np.max(left_knee_angles) - np.min(left_knee_angles)
 
-    # Basic threshold to decide if it looks like squat form
-    angle_min = np.min(knee_angles)
-    angle_max = np.max(knee_angles)
+    # If knee range is big, guess squat
+    if knee_range > 70:
+        return "Squat"
+    # Other heuristics for different exercises...
+    return "Unknown"
 
-    # Arbitrary thresholds for demonstration
-    if angle_min < 60 and angle_max > 120:
-        description = (f"This video likely demonstrates a squat movement, "
-                       f"with knee angles varying from around {angle_min:.1f}° to {angle_max:.1f}°.")
-    else:
-        description = (f"Movements do not match a typical squat range. Knee angles: "
-                       f"min {angle_min:.1f}°, max {angle_max:.1f}°.")
+def generate_text_summary(exercise_type, angle_time_series):
+    if not angle_time_series:
+        return "No pose landmarks detected in the video."
 
-    return description
+    if exercise_type == "Squat":
+        left_knee = [f['left_knee'] for f in angle_time_series if 'left_knee' in f]
+        min_knee = np.min(left_knee)
+        max_knee = np.max(left_knee)
+        avg_knee = np.mean(left_knee)
+
+        return (f"This video appears to show a Squat. "
+                f"Knee angle ranged from {min_knee:.1f}° to {max_knee:.1f}°, averaging {avg_knee:.1f}°. "
+                f"This suggests a complete movement through the squat range of motion.")
+
+    # Add more descriptions for each recognized exercise
+    return "The movement does not match a recognized exercise pattern."
 
 if __name__ == "__main__":
-    # Base directory where videos are stored
     videos_base_dir = "data"
-
-    # Output file to store summaries
     output_file = "video_summaries.txt"
 
+    # Check if data directory exists
+    if not os.path.exists(videos_base_dir):
+        print(f"Error: Directory '{videos_base_dir}' does not exist")
+        exit(1)
+
+    video_count = 0
     with open(output_file, "w") as out_f:
-        # Walk through the videos base directory recursively
         for root, dirs, files in os.walk(videos_base_dir):
-            for file in files:
-                if file.lower().endswith(".mp4"):
-                    video_path = os.path.join(root, file)
-                    print("Processing:", video_path)
+            mp4_files = [f for f in files if f.lower().endswith(".mp4")]
+            if not mp4_files:
+                print(f"No MP4 files found in {root}")
+                continue
+                
+            print(f"Found {len(mp4_files)} MP4 files in {root}")
+            
+            for file in mp4_files:
+                video_count += 1
+                video_path = os.path.join(root, file)
+                print(f"\nProcessing video {video_count}: {file}")
+                
+                try:
                     angles = process_video(video_path)
-                    summary = generate_text_summary(angles)
-                    out_f.write(f"File: {video_path}\n")
-                    out_f.write(f"Summary: {summary}\n\n")
-                    print("Summary:", summary)
+                    exercise_type = identify_exercise(angles)
+                    summary = generate_text_summary(exercise_type, angles)
+                    out_f.write(f"File: {video_path}\nSummary: {summary}\n\n")
+                except Exception as e:
+                    print(f"Error processing {file}: {str(e)}")
+                    out_f.write(f"File: {video_path}\nError: Failed to process video - {str(e)}\n\n")
+
+    print(f"\nProcessing complete. Processed {video_count} videos.")
